@@ -57,54 +57,29 @@ using System.Collections;
 using System.Collections.Generic;
 
 
-namespace EventControllerEditor
+
+namespace EventControl.EventControllerEditor
 {
-    //接続点のサイド
-    public enum JUNCTION_SIDE
-    {
-        LEFT,
-        RIGHT
-    }
 
-    //ノードのカラー
-    public enum NODE_COLOR
-    {
-        BLUE = 1,
-        GREEN = 3,
-        YELLOW = 4,
-        ORANGE = 5,
-        RED = 6
-    }
 
-    //接続点の設定のためのクラス
-    public class JunctionPosition
-    {
-        public JUNCTION_SIDE side = JUNCTION_SIDE.LEFT;
-        public int top;
 
-        public JunctionPosition(JUNCTION_SIDE side, int top)
-        {
-            this.side = side;
-            this.top = top;
-        }
-    }
-
-    //ノードID生成クラス
-    public static class NodeId
-    {
-        static long id = 1;
-        public static long Create()
-        {
-            return id++;
-        }
-    }
 
     //===EditorWindow===========================================================================================================
     public class EditorWindow : UnityEditor.EditorWindow
     {
+        public static EditorWindow Instance { get; private set; }
+
+
+
+
+        public bool MouseIsInGraphArea { get; private set; }
+
+
+
+
         //===パラメータ============================================================================
         //EventController
-        EventController eventCtrlBeingEdited = null;
+        EventController eventControllerUnderEditing = null;
 
         //Save用
         SerializedObject serializedCurrentEventCtrl = null;
@@ -112,24 +87,37 @@ namespace EventControllerEditor
         SerializedProperty serializedParamList = null;
 
         //Layer
-        EventController.Layer currentLayer = null;
+        Layer currentLayer = null;
 
-        EventController.EventNode currentEventNodePrev = null;
+        EventNode currentEventNodePrev = null;
+
+        Node selectedNodePrev = null;
 
         BaseEventClip inputEventClip;
+        MonoScript inputMonoScript;
         Dictionary<int, Node> nodes = new Dictionary<int, Node>();
 
         bool eventClipFoldout = false;
         SerializedPropertyDrawer eventClipPropertyDrawer = new SerializedPropertyDrawer();
         BaseEventClip selectedEventClip = null;
         BaseEventClip selectedEventClipPrev = null;
+
+
         Vector2 eventClipSettingScroll;
+        Vector2 parameterListScroll;
+
+
+        MessageWindow messageWindow = new MessageWindow(new Vector2(100.0f, 20.0f), false, 20);
 
         //Editorによる編集を行うかどうか
         bool enabled = false;
 
         bool isPlayingPrev = false;
         bool isCompilingPrev = false;
+
+        Rect sideAreaRect;
+        Rect graphAreaRect;
+
 
 
         //UnityEditorの初期化を検知
@@ -147,7 +135,7 @@ namespace EventControllerEditor
         public static void Open()
         {
             var window = GetWindow<EditorWindow>();
-            window.minSize = new Vector2(600f, 300f);
+            window.minSize = new Vector2(100f, 100f);
         }
 
         void Init()
@@ -155,6 +143,8 @@ namespace EventControllerEditor
             wantsMouseMove = true;
             ConnectorManager.Init();
             NodeManager.Init();
+
+            Instance = this;
         }
 
         void OnGUI()
@@ -216,7 +206,7 @@ namespace EventControllerEditor
             if (!EditorApplication.isPlaying && EditorApplication.isPlayingOrWillChangePlaymode)
             {
                 EditorGUILayout.LabelField("Restarting...");
-                EditorGUILayout.LabelField("Editor is about to switch to play mode.");
+                EditorGUILayout.LabelField("Editor is switching to play mode.");
             }
 
 
@@ -230,14 +220,14 @@ namespace EventControllerEditor
             //編集中のEventCtrlと選択されたEventCtrlが異なるとき
             if (selectedEventCtrl)
             {
-                if (eventCtrlBeingEdited != selectedEventCtrl)
+                if (eventControllerUnderEditing != selectedEventCtrl)
                 {
-                    eventCtrlBeingEdited = selectedEventCtrl;
+                    eventControllerUnderEditing = selectedEventCtrl;
                     StartEditor();
                 }
             }
 
-            if (!eventCtrlBeingEdited)
+            if (!eventControllerUnderEditing)
             {
                 EditorGUILayout.LabelField("No EventController selected.");
                 enabled = false;
@@ -248,7 +238,7 @@ namespace EventControllerEditor
         //Editorをリセット
         void ResetEditor()
         {
-            eventCtrlBeingEdited = null;
+            eventControllerUnderEditing = null;
         }
 
         //編集処理
@@ -257,7 +247,13 @@ namespace EventControllerEditor
             //userからの入力情報取得
             var currentEvent = Event.current;
 
-            //---ノードの描画---------------------------------------------------------------------------------------
+            // graphAreaのサイズ
+            graphAreaRect = new Rect(sideAreaRect.xMax, sideAreaRect.yMin, position.width - sideAreaRect.xMax, position.height);
+            MouseIsInGraphArea = graphAreaRect.Contains(currentEvent.mousePosition);
+            //Debug.Log(GraphAreaRect);
+
+
+            //---ノードグラフの描画---------------------------------------------------------------------------------------
             if (currentLayer != null)
             {
                 //マウスの中央ボタンでノード全体をドラッグする
@@ -272,6 +268,11 @@ namespace EventControllerEditor
                     Repaint();
                 }
 
+                ConnectorManager.Update(Event.current.mousePosition);
+
+
+
+
                 BeginWindows();
                 foreach (var node in nodes.Values)
                 {
@@ -279,238 +280,463 @@ namespace EventControllerEditor
                 }
                 EndWindows();
 
+
                 // 決定中の接続がある場合は右クリックでキャンセル
-                if (ConnectorManager.HasCurrent && currentEvent.type == EventType.mouseDown && currentEvent.button == 1)
+                if (ConnectorManager.HasCurrent && currentEvent.type == EventType.MouseDown && currentEvent.button == 1)
                 {
                     ConnectorManager.CancelConnecting();
                 }
 
-                ConnectorManager.Update(Event.current.mousePosition);
                 if (ConnectorManager.HasCurrent)
                 {
                     // 関連付けようとしている接続がある場合は描画する
                     Repaint();
                 }
+
+
             }
+
             //----------------------------------------------------------------------------------------------------
 
 
-            //---レイヤーリスト--------------------------------------------------------------------------------
-            EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true), GUILayout.Width(200));
-
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("LayerList");
-
-            GUI.enabled = !EditorApplication.isPlaying;
-            if (GUILayout.Button("+", GUILayout.Width(30)))
+            // --- Side Area -----------------------------------------------------------------------------------------------
+            var sideAreaRectTemp = EditorGUILayout.BeginVertical("box", GUILayout.Width(200), GUILayout.Height(position.height - 6.0f));
             {
-                AddLayer(null);
-            }
-            GUI.enabled = true;
-            EditorGUILayout.EndHorizontal();
+                // BeginVerticalの返り値でゼロのときがある. これは省く.
+                if (sideAreaRectTemp.width != 0.0f && sideAreaRectTemp.height != 0.0f)
+                {
+                    sideAreaRect = sideAreaRectTemp;
+                }
+                //Debug.Log(sideAreaRect);
 
-            for (int i = 0; i < eventCtrlBeingEdited.layerList.Count; i++)
-            {
-                var layer = eventCtrlBeingEdited.layerList[i];
+
+                //---レイヤーリスト--------------------------------------------------------------------------------
+
+                EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true));
 
                 EditorGUILayout.BeginHorizontal();
-
-                serializedCurrentEventCtrl.Update();
-                SerializedProperty serializedLayer = serializedCurrentLayerList.GetArrayElementAtIndex(i);
-                SerializedProperty textProperty = serializedLayer.FindPropertyRelative("name");
-
-                //現在編集されているレイヤー名の前に'*'を表示
-                if (layer == currentLayer)
-                {
-                    EditorGUILayout.LabelField("*", GUILayout.Width(10));
-                }
+                EditorGUILayout.LabelField("LayerList");
 
                 GUI.enabled = !EditorApplication.isPlaying;
-                textProperty.stringValue = EditorGUILayout.TextField(textProperty.stringValue);
+                if (GUILayout.Button("+", GUILayout.Width(30)))
+                {
+                    AddLayer(null);
+                }
                 GUI.enabled = true;
+                EditorGUILayout.EndHorizontal();
 
-                serializedCurrentEventCtrl.ApplyModifiedProperties();
-
-                if (GUILayout.Button("Select", GUILayout.Width(50)))
+                for (int i = 0; i < eventControllerUnderEditing.layerList.Count; i++)
                 {
-                    currentLayer = layer;
-                    SetEditor();
+                    var layer = eventControllerUnderEditing.layerList[i];
+
+                    EditorGUILayout.BeginHorizontal();
+
+                    serializedCurrentEventCtrl.Update();
+                    SerializedProperty serializedLayer = serializedCurrentLayerList.GetArrayElementAtIndex(i);
+                    SerializedProperty textProperty = serializedLayer.FindPropertyRelative("name");
+
+                    //現在編集されているレイヤー名の前に'*'を表示
+                    if (layer == currentLayer)
+                    {
+                        EditorGUILayout.LabelField("*", GUILayout.Width(10));
+                    }
+
+                    GUI.enabled = !EditorApplication.isPlaying;
+                    textProperty.stringValue = EditorGUILayout.TextField(textProperty.stringValue);
+                    GUI.enabled = true;
+
+                    serializedCurrentEventCtrl.ApplyModifiedProperties();
+
+                    if (GUILayout.Button("Select", GUILayout.Width(50)))
+                    {
+                        currentLayer = layer;
+                        SetEditor();
+                    }
+
+                    GUI.enabled = !EditorApplication.isPlaying;
+                    if (GUILayout.Button(string.Empty, GUILayout.Width(30)))
+                    {
+                        GenericMenu menu = new GenericMenu();
+                        menu.AddItem(new GUIContent("Delete"), false, DeleteLayer, layer);
+                        menu.ShowAsContext();
+                    }
+                    GUI.enabled = true;
+
+                    EditorGUILayout.EndHorizontal();
                 }
 
-                GUI.enabled = !EditorApplication.isPlaying;
-                if (GUILayout.Button(string.Empty, GUILayout.Width(30)))
+                EditorGUILayout.EndVertical();
+
+                //レイヤーが選択されていない場合はここで終了する
+                if (currentLayer == null)
                 {
-                    GenericMenu menu = new GenericMenu();
-                    menu.AddItem(new GUIContent("Delete"), false, DeleteLayer, layer);
-                    menu.ShowAsContext();
+                    return;
+                }
+
+                //----------------------------------------------------------------------------------------
+
+                //---ゲーム実行中-------------------------------------------------------------------------------------
+                if (EditorApplication.isPlaying)
+                {
+                    if (currentLayer.currentEventNode != null && currentLayer.currentEventNode != currentEventNodePrev)
+                    {
+                        currentEventNodePrev = currentLayer.currentEventNode;
+
+                        var node = FindNode(currentLayer.serializableEventNodeList[currentLayer.eventNodeList.IndexOf(currentLayer.currentEventNode)]);
+                        NodeManager.running = node;
+                        //if (currentLayer.currentEventNode.eventClip is IMessageableEventClip)
+                        //{
+
+                        //}
+                    }
+
+                    if (NodeManager.running != null)
+                    {
+                        if (NodeManager.running.eventNode.eventClip is IMessageableEventClip)
+                        {
+
+                            messageWindow.Position = new Vector2(NodeManager.running.rect.x, NodeManager.running.rect.y + NodeManager.running.rect.height + 10.0f);
+                            messageWindow.message = ((IMessageableEventClip)NodeManager.running.eventNode.eventClip).Message;
+                            //Debug.Log(messageWindow.message);
+                            messageWindow.Update();
+                        }
+                    }
+
+                    Repaint();
+                }
+
+                // ゲーム実行中ではない場合
+                else
+                {
+                    NodeManager.running = null;
+
+                    //messageWindow.OnGUIEvent = null;
+
+
+                }
+                //-------------------------------------------------------------------------------------------------
+
+                //---ノード詳細画面---------------------------------------------------------------------
+                // ノードを作成するための左カラムを描画していく
+                EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true));
+
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField(currentLayer.name);
+                EditorGUILayout.EndHorizontal();
+
+                //Game再生中は編集させない
+                GUI.enabled = !EditorApplication.isPlaying;
+                {
+                    // テキストを表示するノードの作成
+                    EditorGUILayout.BeginHorizontal();
+                    inputEventClip = EditorGUILayout.ObjectField("EventClip(from GameObject)", inputEventClip, typeof(BaseEventClip), true, GUILayout.ExpandWidth(true)) as BaseEventClip;
+                    //inputMonoScript = EditorGUILayout.ObjectField("EventClip", inputMonoScript, typeof(MonoScript), true, GUILayout.ExpandWidth(true)) as MonoScript;
+                    if (GUILayout.Button("Create", GUILayout.Width(60)))
+                    {
+                        if (inputEventClip == null)
+                        {
+
+                            var eventNode = new SerializableEventNode(inputEventClip);
+
+                            currentLayer.serializableEventNodeList.Add(eventNode);
+
+                            var node = new TextNode(eventNode, NodeColor.Green);
+                            nodes.Add(node.Id, node);
+
+                            inputEventClip = null;
+                        }
+                        else if (inputEventClip.eventController == null)
+                        {
+
+
+                            inputEventClip.eventController = eventControllerUnderEditing;
+                            //inputEventClip.layer = currentLayer;
+
+
+                            var eventNode = new SerializableEventNode(inputEventClip);
+                            eventNode.name = inputEventClip.gameObject.name;
+                            currentLayer.serializableEventNodeList.Add(eventNode);
+
+                            var node = new TextNode(eventNode, NodeColor.Green);
+                            nodes.Add(node.Id, node);
+
+                            inputEventClip = null;
+                        }
+
+                        // 対象のeventclipがすでに割り当てられているとき
+                        else
+                        {
+                            ShowNotification(new GUIContent("This EventClip has already been assigned. "));
+                        }
+
+
+                    }
+
+                    EditorGUILayout.EndHorizontal();
+
+                    EditorGUILayout.BeginHorizontal();
+                    inputMonoScript = EditorGUILayout.ObjectField("EventClip(from MonoScript)", inputMonoScript, typeof(MonoScript), true, GUILayout.ExpandWidth(true)) as MonoScript;
+                    if (GUILayout.Button("Create", GUILayout.Width(60)))
+                    {
+                        //Debug.Log(inputMonoScript.GetClass()); 
+                        if (inputMonoScript != null && inputMonoScript.GetClass() != null && inputMonoScript.GetClass().IsSubclassOf(typeof(BaseEventClip)))
+                        {
+                            var name = inputMonoScript.GetClass().Name;
+
+
+                            //Debug.Log(name);
+                            GameObject go = new GameObject();
+                            go.transform.parent = eventControllerUnderEditing.transform;
+                            go.name = name;
+                            Undo.AddComponent(go, inputMonoScript.GetClass());
+                            Undo.RegisterCreatedObjectUndo(go, "Create Event Node( " + name + " )");
+
+                            var eventNode = new SerializableEventNode(go.GetComponent<BaseEventClip>());
+                            eventNode.eventClip.eventController = eventControllerUnderEditing;
+                            //eventNode.eventClip.layer = currentLayer;
+
+                            eventNode.name = name;
+                            currentLayer.serializableEventNodeList.Add(eventNode);
+
+                            var node = new TextNode(eventNode, NodeColor.Green);
+                            nodes.Add(node.Id, node);
+                            //inputMonoScript = null;
+
+
+                        }
+                        else
+                        {
+                            ShowNotification(new GUIContent("This is not EventClip."));
+                        }
+
+
+
+                        //var eventNode = new EventController.SerializableEventNode(inputEventClip);
+                        //currentLayer.serializableEventNodeList.Add(eventNode);
+
+                        //var node = new TextNode(eventNode, NodeColor.Green);
+                        //nodes.Add(node.Id, node);
+                        //inputEventClip = null;
+                    }
                 }
                 GUI.enabled = true;
 
                 EditorGUILayout.EndHorizontal();
-            }
+                EditorGUILayout.Space();
 
-            EditorGUILayout.EndVertical();
+                EditorGUILayout.EndVertical();
 
-            //レイヤーが選択されていない場合はここで終了する
-            if (currentLayer == null)
-            {
-                return;
-            }
 
-            //----------------------------------------------------------------------------------------
+                EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true));
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField("Node");
+                EditorGUILayout.EndHorizontal();
 
-            //---ゲーム実行中-------------------------------------------------------------------------------------
-            if (EditorApplication.isPlaying)
-            {
-                if (currentLayer.currentEventNode != null && currentLayer.currentEventNode != currentEventNodePrev)
+                var selectedNode = NodeManager.selected;
+
+                // 前回のNodeと異なるとき
+                if (selectedNode != selectedNodePrev)
                 {
-                    currentEventNodePrev = currentLayer.currentEventNode;
-                    NodeManager.running = FindNode(currentLayer.serializableEventNodeList[currentLayer.eventNodeList.IndexOf(currentLayer.currentEventNode)]);
+
+                    GUI.FocusControl("");
+
+
+
+                    selectedNodePrev = selectedNode;
                 }
-                Repaint();
-            }
-            else
-            {
-                NodeManager.running = null;
-            }
-            //-------------------------------------------------------------------------------------------------
 
-            //---ノード詳細画面---------------------------------------------------------------------
-            // ノードを作成するための左カラムを描画していく
-            EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true), GUILayout.Width(200));
-
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField(currentLayer.name);
-            EditorGUILayout.EndHorizontal();
-
-            //Game再生中は編集させない
-            GUI.enabled = !EditorApplication.isPlaying;
-
-            // テキストを表示するノードの作成
-            EditorGUILayout.BeginHorizontal();
-            inputEventClip = EditorGUILayout.ObjectField("EventClip", inputEventClip, typeof(BaseEventClip), true, GUILayout.ExpandWidth(true)) as BaseEventClip;
-
-            if (GUILayout.Button("Create", GUILayout.Width(60)))
-            {
-                var eventNode = new EventController.SerializableEventNode(inputEventClip);
-                currentLayer.serializableEventNodeList.Add(eventNode);
-
-                var node = new TextNode(eventNode, NODE_COLOR.GREEN);
-                nodes.Add(node.Id, node);
-                inputEventClip = null;
-            }
-
-            EditorGUILayout.EndHorizontal();
-
-            EditorGUILayout.Space();
-
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("Node");
-            EditorGUILayout.EndHorizontal();
-
-            var selectedNode = NodeManager.selected;
-            if (selectedNode != null)
-            {
-                if (NodeManager.message == "Edit")
+                if (selectedNode != null)
                 {
-                    EditorGUILayout.BeginHorizontal();
-                    selectedNode.eventNode.name = EditorGUILayout.TextField("Name", selectedNode.eventNode.name);
-                    EditorGUILayout.EndHorizontal();
-
-                    EditorGUILayout.BeginHorizontal();
-                    selectedNode.eventNode.eventClip = EditorGUILayout.ObjectField(
-                        "EventClip", selectedNode.eventNode.eventClip, typeof(BaseEventClip), true, GUILayout.ExpandWidth(true)) as BaseEventClip;
-                    EditorGUILayout.EndHorizontal();
-
-
-                    //---EventClipのプロパティーを表示, 設定--------------------------------------------
-
-                    //Game実行中でも編集可能
-                    GUI.enabled = true;
-
-                    eventClipSettingScroll = EditorGUILayout.BeginScrollView(eventClipSettingScroll);
-                    selectedEventClip = selectedNode.eventNode.eventClip;
-
-                    //タイトル
-                    eventClipFoldout = EditorGUILayout.InspectorTitlebar(eventClipFoldout, selectedEventClip);
-
-                    SerializedObject target = null;
-                    SerializedProperty iterator = null;
-                    if (selectedEventClip != selectedEventClipPrev)
+                    if (NodeManager.message == "Edit")
                     {
-                        target = new SerializedObject(selectedEventClip);
-                        iterator = target.GetIterator();
-                    }
 
-                    //SerializedObjectとproperyが存在するとき
-                    if (target != null && iterator != null)
-                    {
-                        if (eventClipFoldout && iterator.NextVisible(true))
+                        EditorGUILayout.BeginHorizontal();
+                        selectedNode.eventNode.name = EditorGUILayout.TextField("Name", selectedNode.eventNode.name);
+                        EditorGUILayout.EndHorizontal();
+
+
+                        // 取り外し不可能なEventClipの場合は差し替えを許さない
+                        if (selectedNode.eventNode.eventClip is IUndetachableEventClip)
                         {
-                            EditorGUI.indentLevel++;
-
-                            //再帰的にすべてのプロパティーを表示する
-                            do
-                            {
-                                eventClipPropertyDrawer.DrawSerializedProperty(iterator);
-                            }
-                            while (iterator.NextVisible(false));
-
-                            EditorGUI.indentLevel--;
+                            GUI.enabled = false;
                         }
+                        EditorGUILayout.BeginHorizontal();
 
-                        //編集内容を保存
-                        target.ApplyModifiedProperties();
+
+
+                        // Nodeに割り当てるClipの選択
+                        {
+                            var nextEventClip = EditorGUILayout.ObjectField(
+                                "EventClip", selectedNode.eventNode.eventClip, typeof(BaseEventClip), true, GUILayout.ExpandWidth(true)) as BaseEventClip;
+
+                            // 前回のCLipと異なるとき
+                            if (nextEventClip != selectedNode.eventNode.eventClip)
+                            {
+
+
+                                // NullからClip
+                                if (selectedNode.eventNode.eventClip == null && nextEventClip != null)
+                                {
+                                    if (nextEventClip.eventController == null)
+                                    {
+                                        nextEventClip.eventController = eventControllerUnderEditing;
+                                        //nextEventClip.layer = currentLayer;
+                                        selectedNode.eventNode.eventClip = nextEventClip;
+                                    }
+                                    else
+                                    {
+                                        ShowNotification(new GUIContent("This EventClip has already been assigned. "));
+                                    }
+                                }
+
+                                // Clipから別のClip
+                                else if (selectedNode.eventNode.eventClip != null && nextEventClip != null)
+                                {
+                                    if (nextEventClip.eventController == null)
+                                    {
+                                        selectedNode.eventNode.eventClip.eventController = null;
+
+                                        nextEventClip.eventController = eventControllerUnderEditing;
+                                        //nextEventClip.layer = currentLayer;
+                                        selectedNode.eventNode.eventClip = nextEventClip;
+                                    }
+                                    else
+                                    {
+                                        ShowNotification(new GUIContent("This EventClip has already been assigned. "));
+                                    }
+                                }
+
+                                // ClipからNull
+                                else if (selectedNode.eventNode.eventClip != null && nextEventClip == null)
+                                {
+                                    selectedNode.eventNode.eventClip.eventController = null;
+                                    selectedNode.eventNode.eventClip = nextEventClip;
+                                }
+                            }
+                        }
+                        EditorGUILayout.EndHorizontal();
+                        GUI.enabled = true;
+
+                        //---EventClipのプロパティーを表示, 設定--------------------------------------------
+
+                        //Game実行中でも編集可能
+                        GUI.enabled = true;
+
+                        eventClipSettingScroll = EditorGUILayout.BeginScrollView(eventClipSettingScroll);
+                        selectedEventClip = selectedNode.eventNode.eventClip;
+
+                        if (selectedEventClip != null)
+                        {
+                            Selection.activeGameObject = selectedEventClip.gameObject;
+
+                            //タイトル
+                            //eventClipFoldout = EditorGUILayout.InspectorTitlebar(eventClipFoldout, selectedEventClip);
+
+                            //SerializedObject target = null;
+                            //SerializedProperty iterator = null;
+                            //if (selectedEventClip != selectedEventClipPrev)
+                            //{
+                            //    target = new SerializedObject(selectedEventClip);
+                            //    iterator = target.GetIterator();
+                            //}
+
+                            ////SerializedObjectとproperyが存在するとき
+                            //if (target != null && iterator != null)
+                            //{
+                            //    if (eventClipFoldout && iterator.NextVisible(true))
+                            //    {
+                            //        EditorGUI.indentLevel++;
+
+                            //        //再帰的にすべてのプロパティーを表示する
+                            //        do
+                            //        {
+                            //            eventClipPropertyDrawer.DrawSerializedProperty(iterator);
+                            //        }
+                            //        while (iterator.NextVisible(false));
+
+                            //        EditorGUI.indentLevel--;
+                            //    }
+
+                            //    //編集内容を保存
+                            //    target.ApplyModifiedProperties();
+                            //}
+                        }
+                        EditorGUILayout.EndScrollView();
+
                     }
-
-                    EditorGUILayout.EndScrollView();
+                    else if (NodeManager.message == "Delete")
+                    {
+                        DeleteNode(selectedNode);
+                        NodeManager.message = "(non)";
+                        Repaint();
+                    }
                 }
-                else if (NodeManager.message == "Delete")
+                GUI.enabled = true;
+                EditorGUILayout.EndVertical();
+                //----------------------------------------------------------------------------
+
+                //---パラメータ表示-----------------------------------------------------------
+
+                EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true));
+
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField("Parameters");
+
+                // Game実行中はパラメータの追加は認めない
+                if (EditorApplication.isPlaying)
                 {
-                    DeleteNode(selectedNode);
-                    NodeManager.message = "(non)";
-                    Repaint();
+                    GUI.enabled = false;
                 }
+                if (GUILayout.Button(string.Empty, GUILayout.Width(10)))
+                {
+                    GenericMenu menu = new GenericMenu();
+                    menu.AddItem(new GUIContent("Add/Int"), false, AddInt, null);
+                    menu.AddItem(new GUIContent("Add/Float"), false, AddFloat, null);
+                    menu.AddItem(new GUIContent("Add/Bool"), false, AddBool, null);
+                    menu.AddItem(new GUIContent("Add/Trigger"), false, AddTrigger, null);
+                    menu.ShowAsContext();
+                }
+                GUI.enabled = true;
+
+
+                EditorGUILayout.EndHorizontal();
+
+
+                parameterListScroll = EditorGUILayout.BeginScrollView(parameterListScroll);
+
+                UpdateEventCtrlParam();
+
+                EditorGUILayout.EndScrollView();
+
+                EditorGUILayout.EndVertical();
+                // End パラメータ表示 -------------------------------------------------------------------------------------
+
+                //---Conditions表示--------------------------------------------------------
+
+
+                EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true));
+
+                UpdateEventCtrlConditions();
+
+                EditorGUILayout.EndVertical();
+                //---------------------------------------------------------------------------
+
             }
-            GUI.enabled = true;
             EditorGUILayout.EndVertical();
-            //----------------------------------------------------------------------------
+            // End SideArea ----------------
 
-            //---パラメータ表示-----------------------------------------------------------
-            EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true), GUILayout.Width(200));
 
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("Params");
-
-            if (GUILayout.Button(string.Empty, GUILayout.Width(10)))
-            {
-                GenericMenu menu = new GenericMenu();
-                menu.AddItem(new GUIContent("Add/Int"), false, AddInt, null);
-                menu.AddItem(new GUIContent("Add/Float"), false, AddFloat, null);
-                menu.AddItem(new GUIContent("Add/Bool"), false, AddBool, null);
-                menu.AddItem(new GUIContent("Add/Trigger"), false, AddTrigger, null);
-                menu.ShowAsContext();
-            }
-            EditorGUILayout.EndHorizontal();
-
-            UpdateEventCtrlParam();
-
-            EditorGUILayout.EndVertical();
-            //-------------------------------------------------------------------------------------
-
-            //---Conditions表示--------------------------------------------------------
-            EditorGUILayout.BeginVertical("box", GUILayout.ExpandHeight(true), GUILayout.Width(200));
-
-            UpdateEventCtrlConditions();
-
-            EditorGUILayout.EndVertical();
-            //---------------------------------------------------------------------------
-
-            //---何もないところで右クリック選択解除-------------------------------------------------------------
-            if (currentEvent.type == EventType.mouseDown && currentEvent.button == 0)
+            //---グラフエリア内, 何もないところで右クリック選択解除-------------------------------------------------------------
+            if (MouseIsInGraphArea && currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
             {
                 NodeManager.selected = null;
                 ConnectorManager.selected = null;
+
+
+
+                GUI.FocusControl("");
+
+
                 Repaint();
             }
             //-----------------------------------------------------------------------------------------------
@@ -529,13 +755,14 @@ namespace EventControllerEditor
         {
             Init();
 
-            serializedCurrentEventCtrl = new SerializedObject(eventCtrlBeingEdited);
+            serializedCurrentEventCtrl = new SerializedObject(eventControllerUnderEditing);
             serializedCurrentLayerList = serializedCurrentEventCtrl.FindProperty("layerList");
-            serializedParamList = serializedCurrentEventCtrl.FindProperty("paramList");
+            serializedParamList = serializedCurrentEventCtrl.FindProperty("parameterManager").FindPropertyRelative("serializableParameterList");
+            //Debug.Log(serializedParamList.name);
 
-            if (eventCtrlBeingEdited.layerList.Count > 0)
+            if (eventControllerUnderEditing.layerList.Count > 0)
             {
-                currentLayer = eventCtrlBeingEdited.layerList[0];
+                currentLayer = eventControllerUnderEditing.layerList[0];
                 SetEditor();
             }
         }
@@ -556,7 +783,7 @@ namespace EventControllerEditor
             //EventControllerからノードを取得,作成
             foreach (var eventNode in currentLayer.serializableEventNodeList)
             {
-                var node = new TextNode(eventNode, NODE_COLOR.GREEN, eventNode.rect);
+                var node = new TextNode(eventNode, NodeColor.Green, eventNode.rect);
                 if (eventNode.entry)
                 {
                     NodeManager.entry = node;
@@ -590,19 +817,18 @@ namespace EventControllerEditor
             }
         }
 
-        //
-        //関数
-        //  説明:
-        //      パラメータ更新
-        //      ゲーム実行中に変更可能
-        //
+
+        /// <summary>
+        /// パラメータ更新
+        //  ゲーム実行中では, パラメータの追加削除およびパラメータ名の変更は認めない.
+        /// </summary>
         void UpdateEventCtrlParam()
         {
-            for (int i = 0; i < eventCtrlBeingEdited.paramList.Count; i++)
+            for (int i = 0; i < eventControllerUnderEditing.parameterManager.serializableParameterList.Count; i++)
             {
                 EditorGUILayout.BeginHorizontal();
 
-                var param = eventCtrlBeingEdited.paramList[i];
+                var param = eventControllerUnderEditing.parameterManager.serializableParameterList[i];
 
                 serializedCurrentEventCtrl.Update();
                 var serializedParam = serializedParamList.GetArrayElementAtIndex(i);
@@ -611,28 +837,40 @@ namespace EventControllerEditor
                 SerializedProperty floatProperty = serializedParam.FindPropertyRelative("valFloat");
                 SerializedProperty boolProperty = serializedParam.FindPropertyRelative("valBool");
 
+
+                GUI.enabled = !EditorApplication.isPlaying;
                 nameProperty.stringValue = EditorGUILayout.TextField(nameProperty.stringValue, GUILayout.Width(100));
+                GUI.enabled = true;
+
+
                 switch (param.type)
                 {
-                    case EventController.PARAM_TYPE.INT:
-
-                        intProperty.intValue = EditorGUILayout.IntField("(Int)", intProperty.intValue);
+                    case EventControllerParameter.Type.Int:
+                        GUILayout.Label("(Int)", GUILayout.Width(80));
+                        intProperty.intValue = EditorGUILayout.IntField(intProperty.intValue);
                         break;
 
-                    case EventController.PARAM_TYPE.FLOAT:
+                    case EventControllerParameter.Type.Float:
 
-                        floatProperty.floatValue = EditorGUILayout.FloatField("(Float)", floatProperty.floatValue);
+                        GUILayout.Label("(Float)", GUILayout.Width(80));
+                        floatProperty.floatValue = EditorGUILayout.FloatField( floatProperty.floatValue);
                         break;
 
-                    case EventController.PARAM_TYPE.BOOL:
-                        boolProperty.boolValue = EditorGUILayout.Toggle("(Bool)", boolProperty.boolValue);
+                    case EventControllerParameter.Type.Bool:
+
+                        GUILayout.Label("(Bool)", GUILayout.Width(80));
+                        boolProperty.boolValue = EditorGUILayout.Toggle(boolProperty.boolValue);
                         break;
 
-                    case EventController.PARAM_TYPE.TRIGGER:
-                        boolProperty.boolValue = EditorGUILayout.Toggle("(Trigger)", boolProperty.boolValue);
+                    case EventControllerParameter.Type.Trigger:
+
+                        GUILayout.Label("(Trigger)", GUILayout.Width(80));
+                        boolProperty.boolValue = EditorGUILayout.Toggle( boolProperty.boolValue);
                         break;
                 }
 
+
+                GUI.enabled = !EditorApplication.isPlaying;
                 if (GUILayout.Button(string.Empty, GUILayout.Width(10)))
                 {
                     GenericMenu menu = new GenericMenu();
@@ -645,6 +883,10 @@ namespace EventControllerEditor
                     menu.AddItem(new GUIContent("Add/Trigger"), false, AddTrigger, null);
                     menu.ShowAsContext();
                 }
+                GUI.enabled = true;
+
+
+
                 serializedCurrentEventCtrl.ApplyModifiedProperties();
                 EditorGUILayout.EndHorizontal();
             }
@@ -672,7 +914,7 @@ namespace EventControllerEditor
                 if (GUILayout.Button(string.Empty, GUILayout.Width(10)))
                 {
                     GenericMenu menu = new GenericMenu();
-                    foreach (var param in eventCtrlBeingEdited.paramList)
+                    foreach (var param in eventControllerUnderEditing.parameterManager.serializableParameterList)
                     {
                         menu.AddItem(new GUIContent("Add/" + param.name), false, AddCondition, param);
                     }
@@ -686,24 +928,24 @@ namespace EventControllerEditor
                     EditorGUILayout.BeginHorizontal();
 
                     var condition = conditions[i];
-                    condition.paramName = EditorGUILayout.TextField(condition.paramName);
-                    switch (condition.paramType)
+                    condition.parameterName = EditorGUILayout.TextField(condition.parameterName);
+                    switch (condition.parameterType)
                     {
-                        case EventController.PARAM_TYPE.INT:
-                            condition.compareOption = (EventController.COMPARE_OPTIONS)EditorGUILayout.EnumPopup(condition.compareOption);
+                        case EventControllerParameter.Type.Int:
+                            condition.compareOption = (CompareOptions)EditorGUILayout.EnumPopup(condition.compareOption);
                             condition.judgeInt = EditorGUILayout.IntField(condition.judgeInt);
                             break;
 
-                        case EventController.PARAM_TYPE.FLOAT:
-                            condition.compareOption = (EventController.COMPARE_OPTIONS)EditorGUILayout.EnumPopup(condition.compareOption);
+                        case EventControllerParameter.Type.Float:
+                            condition.compareOption = (CompareOptions)EditorGUILayout.EnumPopup(condition.compareOption);
                             condition.judgeFloat = EditorGUILayout.FloatField(condition.judgeFloat);
                             break;
 
-                        case EventController.PARAM_TYPE.BOOL:
+                        case EventControllerParameter.Type.Bool:
                             condition.judgeBool = EditorGUILayout.Toggle(condition.judgeBool);
                             break;
 
-                        case EventController.PARAM_TYPE.TRIGGER:
+                        case EventControllerParameter.Type.Trigger:
                             break;
                     }
 
@@ -714,7 +956,7 @@ namespace EventControllerEditor
 
                         menu.AddItem(new GUIContent("Delete"), false, DeleteCondition, condition);
                         menu.AddSeparator("");
-                        foreach (var param in eventCtrlBeingEdited.paramList)
+                        foreach (var param in eventControllerUnderEditing.parameterManager.serializableParameterList)
                         {
                             menu.AddItem(new GUIContent("Add/" + param.name), false, AddCondition, param);
                         }
@@ -741,17 +983,17 @@ namespace EventControllerEditor
             //各ノードに対する処理
             foreach (var node in nodes.Values)
             {
-                var transitions = new List<EventController.SerializableTransition>();
+                var transitions = new List<SerializableTransition>();
                 foreach (var junction in node.junctionList)
                 {
                     //Exit部分のジャンクションを対象とする
-                    if (junction.side == JUNCTION_SIDE.RIGHT)
+                    if (junction.side == JunctionSide.Right)
                     {
                         var connector = ConnectorManager.GetConnector(node, junction);
                         if (connector != null)
                         {
                             //
-                            var transition = new EventController.SerializableTransition(connector.conditions, currentLayer.serializableEventNodeList.IndexOf(connector.EndNode.eventNode));
+                            var transition = new SerializableTransition(connector.conditions, currentLayer.serializableEventNodeList.IndexOf(connector.EndNode.eventNode));
                             transitions.Add(transition);
                         }
                     }
@@ -777,9 +1019,9 @@ namespace EventControllerEditor
         //          EventController.Param 
         void DeleteParam(object obj)
         {
-            var param = (EventController.Param)obj;
+            var param = (EventControllerParameter)obj;
 
-            eventCtrlBeingEdited.paramList.Remove(param);
+            eventControllerUnderEditing.parameterManager.serializableParameterList.Remove(param);
         }
 
         //
@@ -792,7 +1034,7 @@ namespace EventControllerEditor
         //          null
         void AddInt(object obj)
         {
-            eventCtrlBeingEdited.paramList.Add(new EventController.Param("NewInt", EventController.PARAM_TYPE.INT));
+            eventControllerUnderEditing.parameterManager.serializableParameterList.Add(new EventControllerParameter("NewInt", EventControllerParameter.Type.Int));
         }
 
         //
@@ -805,7 +1047,7 @@ namespace EventControllerEditor
         //          null
         void AddFloat(object obj)
         {
-            eventCtrlBeingEdited.paramList.Add(new EventController.Param("NewFloat", EventController.PARAM_TYPE.FLOAT));
+            eventControllerUnderEditing.parameterManager.serializableParameterList.Add(new EventControllerParameter("NewFloat", EventControllerParameter.Type.Float));
         }
 
         //
@@ -818,7 +1060,7 @@ namespace EventControllerEditor
         //          null
         void AddBool(object obj)
         {
-            eventCtrlBeingEdited.paramList.Add(new EventController.Param("NewBool", EventController.PARAM_TYPE.BOOL));
+            eventControllerUnderEditing.parameterManager.serializableParameterList.Add(new EventControllerParameter("NewBool", EventControllerParameter.Type.Bool));
         }
 
         //
@@ -831,7 +1073,7 @@ namespace EventControllerEditor
         //          null
         void AddTrigger(object obj)
         {
-            eventCtrlBeingEdited.paramList.Add(new EventController.Param("NewTrigger", EventController.PARAM_TYPE.TRIGGER));
+            eventControllerUnderEditing.parameterManager.serializableParameterList.Add(new EventControllerParameter("NewTrigger", EventControllerParameter.Type.Trigger));
         }
 
 
@@ -847,13 +1089,13 @@ namespace EventControllerEditor
         //          EventController.Param 
         void AddCondition(object obj)
         {
-            var param = obj as EventController.Param;
+            var param = obj as EventControllerParameter;
 
             if (ConnectorManager.selected != null)
             {
                 var conditions = ConnectorManager.selected.conditions;
 
-                conditions.Add(new EventController.Condition(param.name, param.type));
+                conditions.Add(new Condition(param.name, param.type));
             }
         }
 
@@ -867,7 +1109,7 @@ namespace EventControllerEditor
         //          EventController.Condition
         void DeleteCondition(object obj)
         {
-            var condition = obj as EventController.Condition;
+            var condition = obj as Condition;
             if (ConnectorManager.selected != null)
             {
                 var conditions = ConnectorManager.selected.conditions;
@@ -879,30 +1121,54 @@ namespace EventControllerEditor
 
         //---Nodeに対する処理-----------------------------------------------------------------------------------------
 
-        void DeleteNode(Node removed)
+        void DeleteEventNode(SerializableEventNode eventNodeToDelete)
         {
-            foreach (var position in removed.junctionList)
+
+            if (eventNodeToDelete.eventClip != null)
             {
-                removed.DeleteTransition(position);
+
+                // 削除対象EventClipの所属情報(EventController)を初期化.
+                eventNodeToDelete.eventClip.eventController = null;
+
+
+                // Nodeから取り外し不可能なClipがある場合は, そのClipがついているGameObjectも削除する.
+                if (eventNodeToDelete.eventClip is IUndetachableEventClip)
+                {
+                    GameObject.DestroyImmediate(eventNodeToDelete.eventClip.gameObject);
+                }
+
+            }
+        }
+
+        void DeleteNode(Node nodeToRemoved)
+        {
+            // 削除対象に接続されている遷移を削除
+            foreach (var position in nodeToRemoved.junctionList)
+            {
+                nodeToRemoved.DeleteTransition(position);
             }
 
+            // Editor上にある削除対象のNodeを検索
             int removedKey = -1;
             foreach (var node in nodes)
             {
-                if (node.Value == removed)
+                if (node.Value == nodeToRemoved)
                 {
                     removedKey = node.Key;
                 }
             }
 
-            currentLayer.serializableEventNodeList.Remove(removed.eventNode);
+            DeleteEventNode(nodeToRemoved.eventNode);
+
+            // LayerからEventNodeを削除
+            currentLayer.serializableEventNodeList.Remove(nodeToRemoved.eventNode);
             if (removedKey != -1)
             {
                 nodes.Remove(removedKey);
             }
         }
 
-        Node FindNode(EventController.SerializableEventNode eventNode)
+        Node FindNode(SerializableEventNode eventNode)
         {
             foreach (var node in nodes.Values)
             {
@@ -919,7 +1185,7 @@ namespace EventControllerEditor
         void AddLayer(object obj)
         {
             string name;
-            if (eventCtrlBeingEdited.layerList.Count > 0)
+            if (eventControllerUnderEditing.layerList.Count > 0)
             {
                 name = "NewLayer";
             }
@@ -927,839 +1193,29 @@ namespace EventControllerEditor
             {
                 name = "BaseLayer";
             }
-            eventCtrlBeingEdited.layerList.Add(new EventController.Layer(name));
+            eventControllerUnderEditing.layerList.Add(new Layer(name));
         }
 
         void DeleteLayer(object obj)
         {
-            EventController.Layer layer = obj as EventController.Layer;
+            Layer layer = obj as Layer;
 
             if (currentLayer == layer)
             {
                 currentLayer = null;
             }
-            eventCtrlBeingEdited.layerList.Remove(layer);
+
+            foreach (var eventNode in layer.serializableEventNodeList)
+            {
+                DeleteEventNode(eventNode);
+            }
+
+            eventControllerUnderEditing.layerList.Remove(layer);
         }
     }
 
 
 
 
-    //コネクターを管理します
-    //ノード同士の接続,解除,
-    public static class ConnectorManager
-    {
-        //===パラメータ=====================================================
-        static List<Connector> connectors;
-        static Dictionary<int, Dictionary<JunctionPosition, Connector>> connected;
-        static Connector current;
-        public static Connector selected;
-        public static Connector Current { get { return current; } }
-        public static bool HasCurrent { get { return current != null; } }
-
-        //===コード==============================================================
-
-        public static void Init()
-        {
-            connectors = new List<Connector>();
-            connected = new Dictionary<int, Dictionary<JunctionPosition, Connector>>();
-            current = null;
-            selected = null;
-        }
-
-        /// <summary>
-        /// あるノードを始点にして接続を作成
-        /// </summary>
-        /// <param name="startNode">始点となるノード</param>
-        /// <param name="startPosition">ノードの接点の位置</param>
-        public static void StartConnecting(Node startNode, JunctionPosition startPosition)
-        {
-            if (current != null)
-            {
-                throw new UnityException("Already started connecting.");
-            }
-
-            if (connected.ContainsKey(startNode.Id) && connected[startNode.Id].ContainsKey(startPosition))
-            {
-                throw new UnityException("Already connected node.");
-            }
-
-            current = new Connector(startNode, startPosition);
-        }
-
-        public static void CancelConnecting()
-        {
-            current = null;
-        }
-
-        public static bool IsCurrent(Node node, JunctionPosition position)
-        {
-            return HasCurrent && current.StartNode.Id == node.Id && current.StartPosition == position;
-        }
-
-        /// <summary>
-        /// 終点となるノードを決定
-        /// </summary>
-        /// <param name="endNode">終点となるノード</param>
-        /// <param name="endPosition">ノードの接点の位置</param>
-        public static void Connect(Node endNode, JunctionPosition endPosition)
-        {
-            if (current == null)
-            {
-                throw new UnityException("No current connector.");
-            }
-
-            current.Connect(endNode, endPosition);
-            connectors.Add(current);
-
-            // 接続情報を登録
-            if (!connected.ContainsKey(current.StartNode.Id))
-            {
-                connected[current.StartNode.Id] = new Dictionary<JunctionPosition, Connector>();
-            }
-            connected[current.StartNode.Id].Add(current.StartPosition, current);
-
-            if (!connected.ContainsKey(current.EndNode.Id))
-            {
-                connected[current.EndNode.Id] = new Dictionary<JunctionPosition, Connector>();
-            }
-            connected[current.EndNode.Id].Add(current.EndPosition, current);
-
-            current = null;
-        }
-
-        /// <summary>
-        /// あるノードの接続点に接続されている接続を返します
-        /// </summary>
-        /// <param name="node">ノード</param>
-        /// <param name="position">接続点の位置</param>
-        /// <returns>接続. 接続されていない場合はnull</returns>
-        public static Connector GetConnector(Node node, JunctionPosition position)
-        {
-            if (connected.ContainsKey(node.Id) && connected[node.Id].ContainsKey(position))
-            {
-                return connected[node.Id][position];
-            }
-            else
-            {
-                return null;
-            }
-        }
-
-        public static bool IsConnected(Node node, JunctionPosition position)
-        {
-            return GetConnector(node, position) != null;
-        }
-
-        /// <summary>
-        /// ある接続点に接続されている接続を解除します
-        /// </summary>
-        /// <param name="node">始点若しくは終点として接続されているノード</param>
-        /// <param name="position">接続点の位置</param>
-        public static void Disconnect(Node node, JunctionPosition position)
-        {
-            var con = GetConnector(node, position);
-            if (con == null)
-            {
-                return;
-            }
-
-            //選択されている接続が削除されるとき
-            if (selected == con)
-            {
-                selected = null;
-            }
-
-            for (int i = 0; i < connectors.Count; i++)
-            {
-                var other = connectors[i];
-                if (con.StartNode.Id == other.StartNode.Id && con.StartPosition == other.StartPosition &&
-                    con.EndNode.Id == other.EndNode.Id && con.EndPosition == other.EndPosition)
-                {
-                    connectors.RemoveAt(i);
-                    break;
-                }
-            }
-
-            connected[con.StartNode.Id].Remove(con.StartPosition);
-            connected[con.EndNode.Id].Remove(con.EndPosition);
-        }
-
-
-        /// <summary>
-        /// 管理している接続の描画
-        /// </summary>
-        /// <param name="mousePosition">マウスの位置情報</param>
-        public static void Update(Vector2 mousePosition)
-        {
-            connectors.ForEach(con => con.Draw());
-
-            if (current != null)
-            {
-                current.DrawTo(mousePosition);
-            }
-        }
-    }
-
-    /// <summary>
-    /// ノード間の接続を表すクラス
-    /// </summary>
-    public class Connector
-    {
-        readonly Color defaultColor = Color.gray;
-        readonly Color selectedColor = Color.blue;
-
-        Color color = Color.gray;
-
-        public Node StartNode { get; private set; }
-        public JunctionPosition StartPosition { get; private set; }
-
-        public Node EndNode { get; private set; }
-        public JunctionPosition EndPosition { get; private set; }
-
-        public List<EventController.Condition> conditions = new List<EventController.Condition>();
-
-        public Connector(Node node, JunctionPosition position)
-        {
-            StartNode = node;
-            StartPosition = position;
-        }
-
-        public void Connect(Node node, JunctionPosition position)
-        {
-            EndNode = node;
-            EndPosition = position;
-        }
-
-        /// <summary>
-        /// 接続を曲線として描画
-        /// </summary>
-        public void Draw()
-        {
-            if (EndNode == null)
-            {
-                throw new UnityException("No end node.");
-            }
-
-            var start = StartNode.CalculateConnectorPoint(StartPosition);
-            var startV3 = new Vector3(start.x, start.y, 0f);
-            var startTan = new Vector3(StartPosition.side == JUNCTION_SIDE.LEFT ? start.x - 100f : start.x + 100f, start.y, 0f);
-
-            var end = EndNode.CalculateConnectorPoint(EndPosition);
-            var endV3 = new Vector3(end.x, end.y, 0f);
-            var endTan = new Vector3(EndPosition.side == JUNCTION_SIDE.LEFT ? end.x - 100f : end.x + 100f, end.y, 0f);
-
-            if (ConnectorManager.selected == this)
-            {
-                color = selectedColor;
-            }
-            else
-            {
-                color = defaultColor;
-            }
-            Handles.DrawBezier(startV3, endV3, startTan, endTan, color, null, 4f);
-        }
-
-        /// <summary>
-        /// 始点となるノードと, 指定の座標を結ぶ直線の描画
-        /// 終点の決定中に始点とマウス間の直線を描画する際に使う
-        /// </summary>
-        /// <param name="end">描画する直線の終点</param>
-        public void DrawTo(Vector2 to)
-        {
-            var start = StartNode.CalculateConnectorPoint(StartPosition);
-            Handles.DrawLine(new Vector3(start.x, start.y, 0f), new Vector3(to.x, to.y, 0f));
-        }
-    }
-
-    //ノードを管理するクラス
-    //ノードからのメッセージを外部に伝えます
-    public static class NodeManager
-    {
-        public static Node selected;
-        public static string message = "(non)";
-        public static Node entry;
-        public static Node running;
-        public static void Init()
-        {
-            message = "(non)";
-            selected = null;
-            entry = null;
-            running = null;
-        }
-    }
-
-    /// <summary>
-    /// ノードの基底クラス
-    /// ノード自身の描画や接続点の管理を行う
-    /// </summary>
-    public abstract class Node
-    {
-        //===パラメータ=====================================================
-        protected readonly Vector2 JunctionSize = new Vector2(10.0f, 10.0f);
-
-        protected readonly NODE_COLOR defaultColor = NODE_COLOR.GREEN;
-        protected readonly NODE_COLOR selectedColor = NODE_COLOR.BLUE;
-        protected readonly NODE_COLOR entryColor = NODE_COLOR.ORANGE;
-        protected readonly NODE_COLOR runningColor = NODE_COLOR.YELLOW;
-
-        public EventController.SerializableEventNode eventNode;
-        int id;
-        public Rect rect;
-        NODE_COLOR color;
-        Vector2 defaultSize = new Vector2(150.0f, 50.0f);
-
-        public List<JunctionPosition> junctionList = new List<JunctionPosition>();
-
-        public int Id { get { return id; } }
-
-        public Rect Rect { get { return rect; } }
-
-
-        //===コード=============================================================================
-
-        public Node(Rect rect, NODE_COLOR color)
-        {
-            id = (int)NodeId.Create();
-            this.rect = rect;
-            this.color = color;
-        }
-
-        public void Update()
-        {
-            if (this == NodeManager.running)
-            {
-                color = runningColor;
-            }
-            else if (this == NodeManager.selected)
-            {
-                color = selectedColor;
-            }
-            else if (eventNode.entry)
-            {
-                color = entryColor;
-            }
-            else
-            {
-                color = defaultColor;
-            }
-
-            rect = GUI.Window(id, rect, WindowCallback, string.Empty, "flow node " + ((int)color).ToString());
-        }
-
-        /// <summary>
-        /// ウィンドウ内のGUI(接続点等)の描画
-        /// </summary>
-        void WindowCallback(int id)
-        {
-            //ユーザーからの処理(各ジャンクション)
-            for (int i = 0; i < junctionList.Count; i++)
-            {
-                JunctionPosition position = junctionList[i];
-                var style = position.side == JUNCTION_SIDE.LEFT ? "LargeButtonRight" : "LargeButtonLeft";
-                if (ConnectorManager.HasCurrent)
-                {
-                    // 決定中の接続がある場合は始点となっている場合, 既に接続済みである場合,決定中の接続と同じサイドに非アクティブ
-                    GUI.enabled = !ConnectorManager.IsConnected(this, position) &&
-                        !ConnectorManager.IsCurrent(this, position) && ConnectorManager.Current.StartPosition.side != position.side;
-
-                    if (GUI.Button(CalculateJunctionRect(position), string.Empty, style))
-                    {
-                        // クリックされたら接続
-                        ConnectorManager.Connect(this, position);
-                    }
-                    GUI.enabled = true;
-                }
-                else
-                {
-                    Event currentEvent = Event.current;
-                    Rect junctionRect = CalculateJunctionRect(position);
-                    EditorGUI.DrawRect(junctionRect, Color.gray);
-
-                    //右クリック
-                    if (currentEvent.type == EventType.MouseDown && currentEvent.button == 1)
-                    {
-                        Vector2 mousePos = currentEvent.mousePosition;
-                        if (junctionRect.Contains(mousePos))
-                        {
-                            GenericMenu menu = new GenericMenu();
-                            if (!EditorApplication.isPlaying)
-                            {
-                                menu.AddItem(new GUIContent("MakeTransition"), false, MakeTransition, position);
-                                menu.AddItem(new GUIContent("EditTransition"), false, EditTransition, position);
-                                menu.AddItem(new GUIContent("DeleteTransition"), false, DeleteTransition, position);
-                                menu.AddSeparator("");
-                                menu.AddItem(new GUIContent("DeleteJunction"), false, DeleteJunction, position);
-                            }
-                            else
-                            {
-                                menu.AddDisabledItem(new GUIContent("MakeTransition"));
-                                menu.AddDisabledItem(new GUIContent("EditTransition"));
-                                menu.AddDisabledItem(new GUIContent("DeleteTransition"));
-                                menu.AddSeparator("");
-                                menu.AddDisabledItem(new GUIContent("DeleteJunction"));
-                            }
-
-                            menu.ShowAsContext();
-                            currentEvent.Use();
-                        }
-                    }
-
-                    //左クリック
-                    if (currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
-                    {
-                        Vector2 mousePos = currentEvent.mousePosition;
-                        if (junctionRect.Contains(mousePos))
-                        {
-                            EditTransition(position);
-                            currentEvent.Use();
-                        }
-                    }
-                }
-            }
-
-
-            //ユーザーからの処理(Node全体)
-            {
-                Event currentEvent = Event.current;
-                Rect contextRect = new Rect(0.0f, 0.0f, rect.width, rect.height);
-
-                //右クリック
-                if (currentEvent.type == EventType.MouseDown && currentEvent.button == 1)
-                {
-                    Vector2 mousePos = currentEvent.mousePosition;
-                    if (contextRect.Contains(mousePos))
-                    {
-                        GenericMenu menu = new GenericMenu();
-
-                        if (!EditorApplication.isPlaying)
-                        {
-                            menu.AddItem(new GUIContent("NewEntrance"), false, NodeMenu, "NewEntrance");
-                            menu.AddItem(new GUIContent("NewExit"), false, NodeMenu, "NewExit");
-                            menu.AddSeparator("");
-                            menu.AddItem(new GUIContent("Edit"), false, NodeMenu, "Edit");
-                            menu.AddItem(new GUIContent("SetAsEntry"), false, NodeMenu, "SetAsEntry");
-                            menu.AddItem(new GUIContent("Delete"), false, NodeMenu, "Delete");
-
-                        }
-                        else
-                        {
-                            menu.AddDisabledItem(new GUIContent("NewEntrance"));
-                            menu.AddDisabledItem(new GUIContent("NewExit"));
-                            menu.AddSeparator("");
-                            menu.AddDisabledItem(new GUIContent("Edit"));
-                            menu.AddDisabledItem(new GUIContent("SetAsEntry"));
-                            menu.AddDisabledItem(new GUIContent("Delete"));
-                        }
-
-                        menu.ShowAsContext();
-                        currentEvent.Use();
-                    }
-                }
-
-                //左クリック
-                if (currentEvent.type == EventType.MouseDown && currentEvent.button == 0)
-                {
-                    Vector2 mousePos = currentEvent.mousePosition;
-                    if (contextRect.Contains(mousePos))
-                    {
-                        NodeMenu("Edit");
-                        //ここで'currentEvent.Use()'を使わない;もし使うとノードを移動できなくなる
-                        //Eventが消費されてしまう
-                    }
-                }
-            }
-
-            OnGUI();
-            GUI.DragWindow();
-        }
-
-
-        // ノードの種別毎のUIは子クラスで実装
-        abstract protected void OnGUI();
-
-        /// <summary>
-        /// 接続点の描画位置を計算して返す
-        /// </summary>
-        /// <param name="position">接続点の位置</param>
-        /// <returns>接続点の描画位置を表す矩形</returns>
-        Rect CalculateJunctionRect(JunctionPosition position)
-        {
-            var isLeft = (position.side == JUNCTION_SIDE.LEFT);
-            var x = isLeft ? 0.0f : rect.width - JunctionSize.x;
-            var y = Mathf.Floor(position.top * JunctionSize.y * 2);
-
-            return new Rect(x, y, JunctionSize.x, JunctionSize.y);
-        }
-
-        /// <summary>
-        /// 接続点を結ぶ接続を描画する際の始点若しくは終点の座標位置を計算して返す
-        /// </summary>
-        /// <param name="position"></param>
-        /// <returns></returns>
-        public Vector2 CalculateConnectorPoint(JunctionPosition position)
-        {
-            var junction = CalculateJunctionRect(position);
-
-            var isLeft = (position.side == JUNCTION_SIDE.LEFT);
-            var x = isLeft ? junction.x : junction.x + junction.width;
-            var y = junction.y + JunctionSize.y / 2.0f;
-
-            // ノード(ウィンドウ)の位置を加算して返す
-            return new Vector2(x + rect.x, y + rect.y);
-        }
-
-        //
-        //関数
-        //  説明:
-        //      ノードメニュー画面から処理の内容を受け取り、
-        //      各処理内容に応じて処理します
-        //
-        void NodeMenu(object obj)
-        {
-            if ((string)obj == "NewEntrance")
-            {
-                AddEntrance();
-            }
-            else if ((string)obj == "NewExit")
-            {
-                AddExit();
-            }
-            else if ((string)obj == "Edit")
-            {
-                NodeManager.message = "Edit";
-                NodeManager.selected = this;
-            }
-            else if ((string)obj == "Delete")
-            {
-                NodeManager.message = "Delete";
-                NodeManager.selected = this;
-            }
-            else if ((string)obj == "SetAsEntry")
-            {
-                if (NodeManager.entry != null)
-                {
-                    NodeManager.entry.eventNode.entry = false;
-                }
-                eventNode.entry = true;
-                NodeManager.entry = this;
-            }
-        }
-
-        void MakeTransition(object obj)
-        {
-            JunctionPosition position = obj as JunctionPosition;
-
-            if (!ConnectorManager.IsConnected(this, (JunctionPosition)position))
-            {
-                ConnectorManager.StartConnecting(this, (JunctionPosition)position);
-            }
-        }
-
-        public void DeleteTransition(object obj)
-        {
-            JunctionPosition position = obj as JunctionPosition;
-
-            if (ConnectorManager.IsConnected(this, (JunctionPosition)position))
-            {
-                ConnectorManager.Disconnect(this, position);
-            }
-        }
-
-        void DeleteJunction(object obj)
-        {
-            JunctionPosition position = obj as JunctionPosition;
-            DeleteTransition(position);
-
-            var targetSide = position.side;
-            var targetTop = position.top;
-
-            junctionList.Remove(position);
-
-            foreach (JunctionPosition junction in junctionList)
-            {
-                if (junction.side == targetSide && junction.top > targetTop)
-                {
-                    junction.top--;
-                }
-            }
-
-            ResizeNode();
-        }
-
-        void EditTransition(object obj)
-        {
-            JunctionPosition position = obj as JunctionPosition;
-
-            var connector = ConnectorManager.GetConnector(this, position);
-            if (connector != null)
-            {
-                ConnectorManager.selected = connector;
-            }
-            else
-            {
-                ConnectorManager.selected = null;
-            }
-        }
-
-        public JunctionPosition AddEntrance()
-        {
-            int count = 0;
-            foreach (JunctionPosition junction in junctionList)
-            {
-                if (junction.side == JUNCTION_SIDE.LEFT)
-                {
-                    count++;
-                }
-            }
-
-            junctionList.Add(new JunctionPosition(JUNCTION_SIDE.LEFT, count));
-            ResizeNode();
-
-            return junctionList[junctionList.Count - 1];
-        }
-
-        public JunctionPosition AddExit()
-        {
-            int count = 0;
-            foreach (JunctionPosition junction in junctionList)
-            {
-                if (junction.side == JUNCTION_SIDE.RIGHT)
-                {
-                    count++;
-                }
-            }
-
-            junctionList.Add(new JunctionPosition(JUNCTION_SIDE.RIGHT, count));
-            ResizeNode();
-
-            return junctionList[junctionList.Count - 1];
-        }
-
-        void ResizeNode()
-        {
-            int topRight = 0;
-            int topLeft = 0;
-
-            int topMax = 0;
-            foreach (JunctionPosition junction in junctionList)
-            {
-                if (junction.side == JUNCTION_SIDE.LEFT)
-                {
-                    topLeft++;
-                }
-                else if (junction.side == JUNCTION_SIDE.RIGHT)
-                {
-                    topRight++;
-                }
-            }
-
-            topMax = (topRight > topLeft ? topRight : topLeft);
-
-            float newHeight = Mathf.Floor(topMax * JunctionSize.y * 2);
-
-            if (newHeight < defaultSize.y)
-            {
-                rect.height = defaultSize.y;
-            }
-            else
-            {
-                rect.height = newHeight;
-            }
-        }
-    }
-
-    /// <summary>
-    /// テキストを表示するノード
-    /// </summary>
-    public class TextNode : Node
-    {
-        string text;
-
-        public TextNode(EventController.SerializableEventNode eventNode, NODE_COLOR color) : base(new Rect(310, 10, 150, 50), color)
-        {
-            this.text = eventNode.name;
-            this.eventNode = eventNode;
-        }
-
-        public TextNode(EventController.SerializableEventNode eventNode, NODE_COLOR color, Rect rect) : base(rect, color)
-        {
-            this.text = eventNode.name;
-            this.eventNode = eventNode;
-        }
-
-        protected override void OnGUI()
-        {
-            var style = EditorStyles.wordWrappedLabel;
-            var defaultAlignment = style.alignment;
-            style.alignment = TextAnchor.MiddleCenter;
-
-            var rect = new Rect(JunctionSize.x, 0, Rect.width - JunctionSize.x * 2, Rect.height);
-
-            this.text = eventNode.name;
-            GUI.Label(rect, text, style);
-
-            style.alignment = defaultAlignment;
-        }
-    }
-
-    public class SerializedPropertyDrawer
-    {
-        const int defaultVisibleArrayElements = 20;
-        int maxVisibleArrayElements = defaultVisibleArrayElements;
-        bool someArrayVisible;
-
-
-        public void DrawSerializedProperty(SerializedProperty property)
-        {
-            //配列が表示されていないとき表示数をリセット
-            if (!someArrayVisible)
-            {
-                maxVisibleArrayElements = defaultVisibleArrayElements;
-            }
-            else
-            {
-                someArrayVisible = true;
-            }
-
-            switch (property.propertyType)
-            {
-                //List, Arrayなど
-                case SerializedPropertyType.Generic:
-                    property.isExpanded = EditorGUILayout.Foldout(property.isExpanded, property.name);
-                    if (!property.isExpanded)
-                    {
-                        break;
-                    }
-
-                    //インデント
-                    EditorGUI.indentLevel++;
-
-                    //配列ではないとき
-                    if (!property.isArray)
-                    {
-                        //要素数が変わるものはコピーする
-                        var child = property.Copy();
-                        var end = property.GetEndProperty(true);
-
-                        if (child.Next(true))
-                        {
-                            while (!SerializedProperty.EqualContents(child, end))
-                            {
-                                DrawSerializedProperty(child);
-                                if (!child.Next(false))
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    //配列の場合は用意されているAPIを使用する
-                    else
-                    {
-                        property.arraySize = EditorGUILayout.IntField("Length", property.arraySize);
-                        var showCount = Mathf.Min(property.arraySize, maxVisibleArrayElements);
-                        for (int i = 0; i < showCount; i++)
-                        {
-                            DrawSerializedProperty(property.GetArrayElementAtIndex(i));
-                        }
-
-                        //重くなるのですべて表示しない
-                        if (property.arraySize > showCount)
-                        {
-                            GUILayout.BeginHorizontal();
-
-                            //インデント
-                            for (int i = 0; i < EditorGUI.indentLevel; i++)
-                            {
-                                GUILayout.Space(EditorGUIUtility.singleLineHeight);
-                            }
-
-                            if (GUILayout.Button("Show more..."))
-                            {
-                                maxVisibleArrayElements += defaultVisibleArrayElements;
-                            }
-                            GUILayout.EndHorizontal();
-                            someArrayVisible = true;
-                        }
-                    }
-
-                    //インデントを戻す
-                    EditorGUI.indentLevel--;
-                    break;
-
-                case SerializedPropertyType.Integer:
-                    property.intValue = EditorGUILayout.IntField(property.name, property.intValue);
-                    break;
-
-                case SerializedPropertyType.Boolean:
-                    property.boolValue = EditorGUILayout.Toggle(property.name, property.boolValue);
-                    break;
-
-                case SerializedPropertyType.Float:
-                    property.floatValue = EditorGUILayout.FloatField(property.name, property.floatValue);
-                    break;
-
-                case SerializedPropertyType.String:
-                    property.stringValue = EditorGUILayout.TextField(property.name, property.stringValue);
-                    break;
-
-                case SerializedPropertyType.Color:
-                    property.colorValue = EditorGUILayout.ColorField(property.name, property.colorValue);
-                    break;
-
-                case SerializedPropertyType.ObjectReference:
-                    property.objectReferenceValue = EditorGUILayout.ObjectField(
-                        property.name, property.objectReferenceValue, typeof(Object), true);
-                    break;
-
-                case SerializedPropertyType.LayerMask:
-                    property.intValue = EditorGUILayout.LayerField(property.name, property.intValue);
-                    break;
-
-                case SerializedPropertyType.Enum:
-                    property.enumValueIndex = EditorGUILayout.Popup(property.name, property.enumValueIndex, property.enumNames);
-                    break;
-
-                case SerializedPropertyType.Vector2:
-                    property.vector2Value = EditorGUILayout.Vector2Field(property.name, property.vector2Value);
-                    break;
-
-                case SerializedPropertyType.Vector3:
-                    property.vector3Value = EditorGUILayout.Vector3Field(property.name, property.vector3Value);
-                    break;
-
-                case SerializedPropertyType.Vector4:
-                    property.vector4Value = EditorGUILayout.Vector4Field(property.name, property.vector4Value);
-                    break;
-
-                case SerializedPropertyType.Rect:
-                    property.rectValue = EditorGUILayout.RectField(property.name, property.rectValue);
-                    break;
-
-                case SerializedPropertyType.Character:
-                    EditorGUILayout.PropertyField(property);
-                    break;
-
-                case SerializedPropertyType.AnimationCurve:
-                    property.animationCurveValue = EditorGUILayout.CurveField(property.name, property.animationCurveValue);
-                    break;
-
-                case SerializedPropertyType.Bounds:
-                    property.boundsValue = EditorGUILayout.BoundsField(property.name, property.boundsValue);
-                    break;
-
-                case SerializedPropertyType.Gradient:
-                    EditorGUILayout.PropertyField(property);
-                    break;
-
-                case SerializedPropertyType.Quaternion:
-                    property.quaternionValue = Quaternion.Euler(
-                        EditorGUILayout.Vector3Field(property.name, property.quaternionValue.eulerAngles));
-                    break;
-            }
-        }
-    }
 }
 

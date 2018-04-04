@@ -13,7 +13,7 @@ using UnityEngine;
 using System.Collections;
 using System;
 
-public class EventClipSample : BaseEventClip
+public class SampleEventClip : BaseEventClip
 {
 
     public override void StartEvent()
